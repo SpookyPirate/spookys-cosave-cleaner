@@ -1304,6 +1304,7 @@ class STRLEditorDialog:
         self.dialog.configure(bg=BG)
         self.dialog.transient(parent_app.root)
         self.dialog.grab_set()
+        _apply_icon(self.dialog)
 
         # Dark title bar on Windows 11
         try:
@@ -1555,6 +1556,25 @@ class STRLEditorDialog:
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
+def _get_icon_path():
+    """Find the icon file, works both from source and PyInstaller bundle."""
+    import sys
+    if getattr(sys, '_MEIPASS', None):
+        return os.path.join(sys._MEIPASS, 'icon.ico')
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'graphics', 'icon.ico')
+
+
+def _apply_icon(window):
+    """Apply the app icon to a tk window/toplevel."""
+    try:
+        ico = _get_icon_path()
+        if os.path.exists(ico):
+            window.iconbitmap(ico)
+    except Exception:
+        pass
+
+
 def main():
     root = tk.Tk()
 
@@ -1568,6 +1588,8 @@ def main():
             ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
     except Exception:
         pass
+
+    _apply_icon(root)
 
     app = CosaveCleanerApp(root)
     root.mainloop()

@@ -1,6 +1,14 @@
+<p align="center">
+  <img src="graphics/spookys-cosave-cleaner-logo.png" alt="Spooky's CoSave Cleaner" width="128">
+</p>
+
 # Spooky's CoSave Cleaner
 
 A GUI tool for inspecting and surgically cleaning SKSE co-save (`.skse`) files used by Skyrim Special Edition and Skyrim VR. Built with Python and tkinter — no external dependencies.
+
+<p align="center">
+  <img src="graphics/spookys-cosave-cleaner-ui-picture-1.png" alt="Spooky's CoSave Cleaner UI" width="900">
+</p>
 
 ## What It Does
 
