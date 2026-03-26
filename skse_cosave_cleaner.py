@@ -1632,7 +1632,7 @@ class ProblemScannerDialog:
 
         self.tree.tag_configure("critical", foreground=DANGER)
         self.tree.tag_configure("warning", foreground=WARNING)
-        self.tree.tag_configure("note", foreground=FG_DIM)
+        self.tree.tag_configure("note", foreground="#B0B0B0")
         self.tree.tag_configure("info", foreground=ACCENT)
         self.tree.tag_configure("checked", foreground=DANGER)
 
