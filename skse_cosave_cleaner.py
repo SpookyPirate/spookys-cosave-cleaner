@@ -480,7 +480,7 @@ def rebuild_strl_data(raw_data, entries, remove_set):
 class CosaveCleanerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Spooky's CoSave Cleaner")
+        self.root.title("Spooky's CoSave Cleaner v1.2")
         self.root.geometry("1200x800")
         self.root.minsize(900, 600)
         self.root.configure(bg=BG)
