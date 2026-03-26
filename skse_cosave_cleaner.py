@@ -8,6 +8,7 @@ Dependencies: Python stdlib only (tkinter, struct, os)
 
 import struct
 import os
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -134,6 +135,12 @@ def format_size(size):
         return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
 
+def _natural_sort_key(text):
+    """Sort key that handles embedded numbers naturally (Plugin 2 before Plugin 10)."""
+    parts = re.split(r'(\d+)', text.lower())
+    return [int(p) if p.isdigit() else p for p in parts]
+
+
 def parse_cosave(data):
     """Parse the .skse co-save and return structured data."""
     if len(data) < 20:
@@ -251,6 +258,75 @@ def rebuild_cosave(data, header, plugins, remove_set):
             out.extend(chunk['raw_data'])
 
     return bytes(out), removed_chunks, total_removed_bytes
+
+
+# ─── PLGN Parser (Active Mod List) ──────────────────────────────────────────
+
+def parse_plgn_chunk(plugins):
+    """Extract the active mod list from the SKSE Core PLGN chunk.
+    Returns (regular_mods, esl_mods) where:
+      regular_mods = {mod_index: mod_name, ...}  (index 0x00-0xFD)
+      esl_mods = {esl_index: mod_name, ...}      (0xFE:xxxx namespace)
+    Returns (None, None) if PLGN chunk not found."""
+    for plugin in plugins:
+        if plugin['uid'] != 0x00000000:
+            continue
+        for chunk in plugin['chunks']:
+            if fourcc_str(chunk['type']) != 'PLGN':
+                continue
+
+            raw = chunk['raw_data']
+            if len(raw) < 2:
+                return None, None
+
+            count = struct.unpack('<H', raw[:2])[0]
+            pos = 2
+            regular_mods = {}
+            esl_mods = {}
+
+            for _ in range(count):
+                if pos >= len(raw):
+                    break
+                mod_idx = raw[pos]; pos += 1
+
+                if mod_idx == 0xFE:
+                    # ESL entry: u16 esl_index, u16 name_len, name
+                    if pos + 4 > len(raw):
+                        break
+                    esl_idx = struct.unpack('<H', raw[pos:pos + 2])[0]; pos += 2
+                    name_len = struct.unpack('<H', raw[pos:pos + 2])[0]; pos += 2
+                    if pos + name_len > len(raw):
+                        break
+                    name = raw[pos:pos + name_len].decode('ascii', errors='replace')
+                    pos += name_len
+                    esl_mods[esl_idx] = name
+                else:
+                    # Regular entry: u16 name_len, name
+                    if pos + 2 > len(raw):
+                        break
+                    name_len = struct.unpack('<H', raw[pos:pos + 2])[0]; pos += 2
+                    if pos + name_len > len(raw):
+                        break
+                    name = raw[pos:pos + name_len].decode('ascii', errors='replace')
+                    pos += name_len
+                    regular_mods[mod_idx] = name
+
+            return regular_mods, esl_mods
+
+    return None, None
+
+
+def get_active_mod_names(plugins):
+    """Get a set of all active mod names (lowercased) from the PLGN chunk."""
+    regular, esl = parse_plgn_chunk(plugins)
+    if regular is None:
+        return None
+    names = set()
+    for name in regular.values():
+        names.add(name.lower())
+    for name in esl.values():
+        names.add(name.lower())
+    return names
 
 
 # ─── STRL Data Parser/Rebuilder ──────────────────────────────────────────────
@@ -468,7 +544,11 @@ class CosaveCleanerApp:
                          fieldbackground=BG_SECONDARY, rowheight=22,
                          font=("Consolas", 9))
         style.configure("Treeview.Heading", background=BG, foreground=FG_HEADER,
-                         font=("Segoe UI", 9, "bold"))
+                         font=("Segoe UI", 9, "bold"), relief="flat")
+        style.map("Treeview.Heading",
+                   background=[("active", BG_SECONDARY), ("pressed", BG_SECONDARY)],
+                   foreground=[("active", FG_HEADER), ("pressed", FG_HEADER)],
+                   relief=[("active", "flat"), ("pressed", "flat")])
         style.map("Treeview",
                    background=[("selected", SELECTION)],
                    foreground=[("selected", FG_HEADER)])
@@ -479,9 +559,20 @@ class CosaveCleanerApp:
                    foreground=[("active", FG_HEADER)])
 
         style.configure("Vertical.TScrollbar", background=BG_SECONDARY,
-                         troughcolor=BG, bordercolor=BG, arrowcolor=FG_DIM)
+                         troughcolor=BG, bordercolor=BG, arrowcolor=FG_DIM,
+                         gripcount=0, relief="flat")
         style.map("Vertical.TScrollbar",
-                   background=[("active", HOVER)])
+                   background=[("active", HOVER), ("pressed", HOVER),
+                               ("disabled", BG)],
+                   arrowcolor=[("disabled", BG)])
+
+        style.configure("Horizontal.TScrollbar", background=BG_SECONDARY,
+                         troughcolor=BG, bordercolor=BG, arrowcolor=FG_DIM,
+                         gripcount=0, relief="flat")
+        style.map("Horizontal.TScrollbar",
+                   background=[("active", HOVER), ("pressed", HOVER),
+                               ("disabled", BG)],
+                   arrowcolor=[("disabled", BG)])
 
         style.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG,
                          insertcolor=FG)
@@ -498,6 +589,11 @@ class CosaveCleanerApp:
         self.btn_open = ttk.Button(toolbar, text="Open File...",
                                     command=self._open_file)
         self.btn_open.pack(side=tk.LEFT)
+
+        self.btn_scan = ttk.Button(toolbar, text="Scan for Problems",
+                                    command=self._open_problem_scanner,
+                                    state=tk.DISABLED)
+        self.btn_scan.pack(side=tk.LEFT, padx=(6, 0))
 
         self.lbl_path = ttk.Label(toolbar, text="No file loaded",
                                    style="Path.TLabel", wraplength=500)
@@ -521,9 +617,32 @@ class CosaveCleanerApp:
         paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # Left: tree
-        tree_frame = ttk.Frame(paned)
-        paned.add(tree_frame, weight=3)
+        # Left: tree + search
+        tree_outer = ttk.Frame(paned)
+        paned.add(tree_outer, weight=3)
+
+        # Search bar
+        search_frame = ttk.Frame(tree_outer, padding=(0, 0, 0, 4))
+        search_frame.pack(fill=tk.X)
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", self._on_search_changed)
+        search_entry = tk.Entry(search_frame, textvariable=self.search_var,
+                                bg=BG_INPUT, fg=FG, insertbackground=FG,
+                                relief=tk.FLAT, font=("Segoe UI", 9),
+                                borderwidth=4)
+        search_entry.pack(fill=tk.X, side=tk.LEFT, expand=True)
+        self._search_entry = search_entry
+
+        # Placeholder text
+        self._search_placeholder = True
+        search_entry.insert(0, "Search plugins & chunks...")
+        search_entry.configure(fg=FG_DIM)
+        search_entry.bind("<FocusIn>", self._on_search_focus_in)
+        search_entry.bind("<FocusOut>", self._on_search_focus_out)
+
+        tree_frame = ttk.Frame(tree_outer)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
 
         self.tree = ttk.Treeview(tree_frame, columns=("size", "check"),
                                   selectmode="browse", show="tree headings")
@@ -663,7 +782,13 @@ class CosaveCleanerApp:
         self.cleaned_data = None
         self.select_all_var.set(False)
 
+        # Clear search
+        self._search_placeholder = False
+        self.search_var.set("")
+        self._on_search_focus_out(None)
+
         self.btn_save.configure(state=tk.DISABLED)
+        self.btn_scan.configure(state=tk.NORMAL)
 
         self._update_header_display()
         self._populate_tree()
@@ -739,6 +864,86 @@ class CosaveCleanerApp:
                     text=f"    {label}",
                     values=(size_str, "\u2610"),  # ☐
                     tags=tuple(tags))
+
+    # ── Search / Filter ──────────────────────────────────────────────────
+
+    def _on_search_focus_in(self, event):
+        if self._search_placeholder:
+            self._search_entry.delete(0, tk.END)
+            self._search_entry.configure(fg=FG)
+            self._search_placeholder = False
+
+    def _on_search_focus_out(self, event):
+        if not self.search_var.get():
+            self._search_placeholder = True
+            self._search_entry.insert(0, "Search plugins & chunks...")
+            self._search_entry.configure(fg=FG_DIM)
+
+    def _on_search_changed(self, *args):
+        if self._search_placeholder:
+            return
+        self._apply_search_filter()
+
+    def _apply_search_filter(self):
+        """Filter tree items based on search text. Shows matching chunks and
+        their parent plugins. If search is empty, shows everything."""
+        query = self.search_var.get().strip().lower()
+        if self._search_placeholder:
+            query = ""
+
+        if not self.plugins:
+            return
+
+        # Detach all items first (much faster than show/hide)
+        for pid in list(self.tree.get_children("")):
+            self.tree.detach(pid)
+
+        if not query:
+            # Restore all items
+            self._repopulate_tree_items()
+            return
+
+        # Find matching plugins and chunks
+        for pi, plugin in enumerate(self.plugins):
+            pid = f"p{pi}"
+            plugin_name = friendly_plugin_name(plugin['uid']).lower()
+            uid_hex = f"0x{plugin['uid']:08x}"
+            plugin_label = self.tree.item(pid, "text").lower()
+            plugin_matches = query in plugin_name or query in uid_hex or query in plugin_label
+
+            matching_chunks = []
+            for ci, chunk in enumerate(plugin['chunks']):
+                cid = f"c{pi}_{ci}"
+                cc = fourcc_str(chunk['type']).lower()
+                desc = CHUNK_DESCRIPTIONS.get(fourcc_str(chunk['type']), "").lower()
+                chunk_label = self.tree.item(cid, "text").lower()
+                if query in cc or query in desc or query in chunk_label or plugin_matches:
+                    matching_chunks.append(cid)
+
+            if plugin_matches or matching_chunks:
+                self.tree.reattach(pid, "", tk.END)
+                # Detach non-matching chunks, reattach matching ones
+                for ci, chunk in enumerate(plugin['chunks']):
+                    cid = f"c{pi}_{ci}"
+                    if plugin_matches or cid in matching_chunks:
+                        self.tree.reattach(cid, pid, tk.END)
+                    else:
+                        self.tree.detach(cid)
+                # Auto-expand plugins when filtering
+                if not plugin_matches and matching_chunks:
+                    self.tree.item(pid, open=True)
+
+    def _repopulate_tree_items(self):
+        """Reattach all tree items in original order (respecting current sort)."""
+        if self.sort_col:
+            self._sort_tree(self.sort_col, toggle=False)
+        else:
+            for pi in range(len(self.plugins)):
+                pid = f"p{pi}"
+                self.tree.reattach(pid, "", tk.END)
+                for ci in range(len(self.plugins[pi]['chunks'])):
+                    cid = f"c{pi}_{ci}"
+                    self.tree.reattach(cid, pid, tk.END)
 
     def _on_tree_select(self, event):
         sel = self.tree.selection()
@@ -856,19 +1061,20 @@ class CosaveCleanerApp:
 
     # ── Sorting ───────────────────────────────────────────────────────────
 
-    def _sort_tree(self, col):
+    def _sort_tree(self, col, toggle=True):
         """Sort the tree by column. Toggles ascending/descending on repeat click."""
         if not self.plugins:
             return
 
-        # Toggle direction if same column clicked again
-        if self.sort_col == col:
-            self.sort_asc = not self.sort_asc
-        else:
-            self.sort_col = col
-            self.sort_asc = True  # size defaults descending on first click
-            if col == "size":
-                self.sort_asc = False
+        if toggle:
+            # Toggle direction if same column clicked again
+            if self.sort_col == col:
+                self.sort_asc = not self.sort_asc
+            else:
+                self.sort_col = col
+                self.sort_asc = True  # size defaults descending on first click
+                if col == "size":
+                    self.sort_asc = False
 
         # Update header arrows
         arrow = " \u25b2" if self.sort_asc else " \u25bc"
@@ -876,19 +1082,22 @@ class CosaveCleanerApp:
         self.tree.heading("size", text="Size" + (arrow if col == "size" else ""))
         self.tree.heading("check", text="Del?" + (arrow if col == "check" else ""))
 
+        # Detach all plugins (batch operation — much faster than individual moves)
+        plugin_items = list(self.tree.get_children(""))
+        for pid in plugin_items:
+            self.tree.detach(pid)
+
         # Build sort keys for plugins
-        plugin_items = self.tree.get_children("")
         plugin_keys = []
         for pid in plugin_items:
             pi = int(pid[1:])
             plugin = self.plugins[pi]
 
             if col == "name":
-                key = friendly_plugin_name(plugin['uid']).lower()
+                key = _natural_sort_key(self.tree.item(pid, "text"))
             elif col == "size":
                 key = plugin['length']
             elif col == "check":
-                # Sort by count of checked chunks (more checked = first)
                 count = sum(1 for ci in range(len(plugin['chunks']))
                             if self.checked.get((pi, ci), tk.BooleanVar()).get())
                 key = count
@@ -899,14 +1108,15 @@ class CosaveCleanerApp:
 
         plugin_keys.sort(key=lambda x: x[0], reverse=not self.sort_asc)
 
-        # Reorder plugins
-        for idx, (_, pid) in enumerate(plugin_keys):
-            self.tree.move(pid, "", idx)
+        # Reattach plugins in sorted order
+        for _, pid in plugin_keys:
+            self.tree.reattach(pid, "", tk.END)
 
         # Sort chunks within each plugin
-        for pid in plugin_items:
+        for _, pid in plugin_keys:
             pi = int(pid[1:])
-            chunk_items = self.tree.get_children(pid)
+            chunk_items = list(self.tree.get_children(pid))
+
             chunk_keys = []
             for cid in chunk_items:
                 parts = cid[1:].split("_")
@@ -914,7 +1124,7 @@ class CosaveCleanerApp:
                 chunk = self.plugins[pi]['chunks'][ci]
 
                 if col == "name":
-                    key = fourcc_str(chunk['type']).lower()
+                    key = _natural_sort_key(fourcc_str(chunk['type']))
                 elif col == "size":
                     key = chunk['length']
                 elif col == "check":
@@ -926,8 +1136,10 @@ class CosaveCleanerApp:
 
             chunk_keys.sort(key=lambda x: x[0], reverse=not self.sort_asc)
 
-            for idx, (_, cid) in enumerate(chunk_keys):
-                self.tree.move(cid, pid, idx)
+            for cid in chunk_items:
+                self.tree.detach(cid)
+            for _, cid in chunk_keys:
+                self.tree.reattach(cid, pid, tk.END)
 
     # ── Details Panel ─────────────────────────────────────────────────────
 
@@ -1100,6 +1312,55 @@ class CosaveCleanerApp:
         sel = self.tree.selection()
         if sel and sel[0] == item_id:
             self._show_details(item_id)
+
+    # ── Problem Scanner ────────────────────────────────────────────────
+
+    def _open_problem_scanner(self):
+        """Open the problem scanner dialog."""
+        if not self.plugins:
+            return
+        dialog = ProblemScannerDialog(self)
+        self.root.wait_window(dialog.dialog)
+
+        strl_cleaned = getattr(dialog, 'result_strl_cleaned', 0)
+        chunk_removes = dialog.result_remove_set
+
+        # Handle surgical STRL cleanup
+        if strl_cleaned > 0:
+            self._set_status(f"Cleaning STRL data ({format_size(strl_cleaned)} removed)...")
+            self.root.update_idletasks()
+            try:
+                cleaned, _, _ = rebuild_cosave(
+                    self.raw_data, self.header, self.plugins, set())
+                h2, p2 = parse_cosave(cleaned)
+                total_chunks = sum(p['num_chunks'] for p in p2)
+                self.cleaned_data = cleaned
+                self.btn_save.configure(state=tk.NORMAL)
+                self._set_status(
+                    f"STRL cleaned: {format_size(strl_cleaned)} reduced. "
+                    f"Verified: {h2['num_plugins']} plugins, {total_chunks} chunks. "
+                    f"Click 'Save As...' to write.")
+                self._save_as()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to rebuild after STRL cleanup:\n{e}")
+                self._set_status("Rebuild failed")
+                return
+
+        # Handle whole-chunk deletions (non-STRL)
+        if chunk_removes:
+            count = 0
+            for (pi, ci) in chunk_removes:
+                key = (pi, ci)
+                if key in self.checked:
+                    self.checked[key].set(True)
+                    self._update_check_display(f"c{pi}_{ci}", True)
+                    count += 1
+            self._update_selection_label()
+            self._update_clean_button()
+            if strl_cleaned == 0:
+                self._set_status(
+                    f"Problem scan: {count} chunk(s) marked for removal. "
+                    f"Click 'Clean Selected' to proceed.")
 
     # ── STRL Entry Editor ─────────────────────────────────────────────────
 
@@ -1278,6 +1539,651 @@ class CosaveCleanerApp:
 
     def _set_status(self, text):
         self.lbl_status.configure(text=text)
+
+
+# ─── Problem Scanner Dialog ──────────────────────────────────────────────────
+
+class ProblemScannerDialog:
+    """Dialog that scans PapyrusUtil (StorageUtil) data for actionable problems:
+    - Empty strings in STRL data (orphaned from removed mods)
+    - Empty lists (0 items) wasting space
+    - Temporary form keys (0xFF) that won't survive reload
+    - Form keys referencing mods no longer in the load order
+    Double-click or click 'View' to inspect a problem in the main browser.
+    Select items and click 'Mark for Removal' to flag them for cleanup."""
+
+    def __init__(self, parent_app):
+        self.app = parent_app
+        self.plugins = parent_app.plugins
+        self.raw_data = parent_app.raw_data
+        self.problems = []  # list of dicts describing each problem
+        self.checked = {}   # problem_index -> BooleanVar
+        self.result_remove_set = None  # set of (pi, ci) if user applies
+        self._sort_col = None
+        self._sort_asc = True
+
+        self.dialog = tk.Toplevel(parent_app.root)
+        self.dialog.title("Problem Scanner")
+        self.dialog.geometry("1000x550")
+        self.dialog.minsize(750, 400)
+        self.dialog.configure(bg=BG)
+        self.dialog.transient(parent_app.root)
+        self.dialog.grab_set()
+        _apply_icon(self.dialog)
+
+        # Dark title bar
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.dialog.winfo_id())
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
+        except Exception:
+            pass
+
+        self._build_ui()
+        self.dialog.after(50, self._run_scan)
+
+    def _build_ui(self):
+        # Info
+        info = ttk.Label(self.dialog,
+            text="Scanning PapyrusUtil (StorageUtil) data for orphaned entries, "
+                 "empty strings, and stale form references. "
+                 "Double-click a row to view it in the main browser.",
+            style="Dim.TLabel", padding=(8, 6))
+        info.pack(fill=tk.X)
+
+        ttk.Separator(self.dialog, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # Treeview
+        tree_frame = ttk.Frame(self.dialog)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.tree = ttk.Treeview(tree_frame,
+            columns=("severity", "plugin", "chunk", "size", "detail", "check"),
+            selectmode="browse", show="headings")
+
+        self.tree.heading("severity", text="Severity", anchor=tk.W,
+                           command=lambda: self._sort_by("severity"))
+        self.tree.heading("plugin", text="Plugin", anchor=tk.W,
+                           command=lambda: self._sort_by("plugin"))
+        self.tree.heading("chunk", text="Chunk", anchor=tk.W,
+                           command=lambda: self._sort_by("chunk"))
+        self.tree.heading("size", text="Size", anchor=tk.E,
+                           command=lambda: self._sort_by("size"))
+        self.tree.heading("detail", text="Details", anchor=tk.W,
+                           command=lambda: self._sort_by("detail"))
+        self.tree.heading("check", text="Del?", anchor=tk.CENTER)
+
+        self.tree.column("severity", width=80, minwidth=60, anchor=tk.W)
+        self.tree.column("plugin", width=160, minwidth=100, anchor=tk.W)
+        self.tree.column("chunk", width=60, minwidth=40, anchor=tk.W)
+        self.tree.column("size", width=80, minwidth=60, anchor=tk.E)
+        self.tree.column("detail", width=420, minwidth=150, anchor=tk.W)
+        self.tree.column("check", width=50, minwidth=40, anchor=tk.CENTER)
+
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                                     command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+        self.tree.tag_configure("critical", foreground=DANGER)
+        self.tree.tag_configure("warning", foreground=WARNING)
+        self.tree.tag_configure("note", foreground=FG_DIM)
+        self.tree.tag_configure("info", foreground=ACCENT)
+        self.tree.tag_configure("checked", foreground=DANGER)
+
+        ttk.Separator(self.dialog, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # Bottom bar
+        bottom = ttk.Frame(self.dialog, padding=(8, 6))
+        bottom.pack(fill=tk.X)
+
+        self.select_all_var = tk.BooleanVar(value=False)
+        self.chk_select_all = ttk.Checkbutton(
+            bottom, text="Select All",
+            variable=self.select_all_var, command=self._toggle_select_all)
+        self.chk_select_all.pack(side=tk.LEFT)
+
+        self.lbl_status = ttk.Label(bottom, text="Scanning...",
+                                     style="Dim.TLabel")
+        self.lbl_status.pack(side=tk.LEFT, padx=(16, 0))
+
+        ttk.Button(bottom, text="Cancel",
+                    command=self.dialog.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.btn_apply = ttk.Button(bottom, text="Fix Selected",
+                                     style="Accent.TButton",
+                                     command=self._apply,
+                                     state=tk.DISABLED)
+        self.btn_apply.pack(side=tk.RIGHT, padx=(4, 0))
+
+        self.btn_view = ttk.Button(bottom, text="View Selected",
+                                    command=self._view_selected,
+                                    state=tk.DISABLED)
+        self.btn_view.pack(side=tk.RIGHT, padx=(4, 0))
+
+    def _run_scan(self):
+        """Scan all chunks for actionable problems in PapyrusUtil data."""
+        self.dialog.update_idletasks()
+
+        # Parse active mod list from PLGN for cross-referencing form keys
+        self.regular_mods, self.esl_mods = parse_plgn_chunk(self.plugins)
+
+        for pi, plugin in enumerate(self.plugins):
+            uid = plugin['uid']
+
+            # Only scan PapyrusUtil — the only plugin we can safely clean
+            if uid != 0x424510A2:
+                continue
+
+            pname = friendly_plugin_name(uid)
+            for ci, chunk in enumerate(plugin['chunks']):
+                cc = fourcc_str(chunk['type'])
+                total_chunk = 12 + chunk['length']
+                self._scan_papyrusutil_chunk(pi, ci, pname, cc, chunk, total_chunk)
+
+        self._populate_tree()
+        self._update_status()
+
+    def _scan_papyrusutil_chunk(self, pi, ci, pname, cc, chunk, total_chunk):
+        """Run PapyrusUtil-specific scans on a chunk.
+        Each problem gets a 'fix_type':
+          'strl_clean_empties' — surgical removal of empty-string STRL entries
+          'strl_clean_orphans' — surgical removal of orphaned form key entries
+          'delete_chunk' — mark entire chunk for removal (non-STRL or unfixable)
+        """
+        raw = chunk['raw_data']
+
+        # STRL empty strings — can be surgically cleaned
+        if cc == "STRL":
+            try:
+                empty_count = self._count_strl_empties(raw)
+                if empty_count > 0:
+                    if empty_count > 10000:
+                        sev, tag = 'CRITICAL', 'critical'
+                    elif empty_count > 100:
+                        sev, tag = 'WARNING', 'warning'
+                    else:
+                        sev, tag = 'NOTE', 'note'
+                    self.problems.append({
+                        'pi': pi, 'ci': ci,
+                        'plugin_name': pname,
+                        'chunk_type': cc,
+                        'chunk_size': total_chunk,
+                        'severity': sev, 'tag': tag,
+                        'reason': f"{empty_count:,} empty string(s) — likely orphaned data",
+                        'fix_type': 'strl_clean_empties',
+                    })
+            except Exception:
+                pass
+
+        # Empty lists (count=0) in list-type chunks
+        if cc in ("STRL", "INTL", "FLTL", "FORL"):
+            try:
+                empty_lists = self._count_empty_lists(raw)
+                if empty_lists > 10:
+                    sev = 'WARNING' if empty_lists > 100 else 'NOTE'
+                    tag = 'warning' if empty_lists > 100 else 'note'
+                    fix = 'strl_clean_empty_lists' if cc == "STRL" else 'delete_chunk'
+                    self.problems.append({
+                        'pi': pi, 'ci': ci,
+                        'plugin_name': pname,
+                        'chunk_type': cc,
+                        'chunk_size': total_chunk,
+                        'severity': sev, 'tag': tag,
+                        'reason': f"{empty_lists:,} empty list(s) (0 items) — wasted space",
+                        'fix_type': fix,
+                    })
+            except Exception:
+                pass
+
+        # StorageUtil form key analysis (all value/list chunks)
+        if cc in ("STRL", "INTL", "FLTL", "FORL", "STRV", "INTV", "FLTV", "FORV"):
+            try:
+                temp_forms, orphan_indices = self._analyze_form_keys(raw)
+                if temp_forms > 0:
+                    sev = 'WARNING' if temp_forms > 10 else 'NOTE'
+                    tag = 'warning' if temp_forms > 10 else 'note'
+                    fix = 'strl_clean_orphans' if cc == "STRL" else 'delete_chunk'
+                    self.problems.append({
+                        'pi': pi, 'ci': ci,
+                        'plugin_name': pname,
+                        'chunk_type': cc,
+                        'chunk_size': total_chunk,
+                        'severity': sev, 'tag': tag,
+                        'reason': f"{temp_forms:,} temporary form key(s) (0xFF) — won't survive reload",
+                        'fix_type': fix,
+                    })
+                if orphan_indices and self.regular_mods is not None:
+                    orphan_names = []
+                    for idx in sorted(orphan_indices):
+                        name = self.regular_mods.get(idx, f"index 0x{idx:02X}")
+                        orphan_names.append(name)
+                    mod_list = ", ".join(orphan_names[:5])
+                    if len(orphan_names) > 5:
+                        mod_list += f", +{len(orphan_names) - 5} more"
+                    count = sum(orphan_indices.values())
+                    sev = 'WARNING' if count > 10 else 'NOTE'
+                    tag = 'warning' if count > 10 else 'note'
+                    fix = 'strl_clean_orphans' if cc == "STRL" else 'delete_chunk'
+                    self.problems.append({
+                        'pi': pi, 'ci': ci,
+                        'plugin_name': pname,
+                        'chunk_type': cc,
+                        'chunk_size': total_chunk,
+                        'severity': sev, 'tag': tag,
+                        'reason': f"{count:,} form key(s) referencing {len(orphan_indices)} "
+                                  f"missing mod index(es): {mod_list}",
+                        'fix_type': fix,
+                    })
+            except Exception:
+                pass
+
+    def _count_strl_empties(self, raw_data):
+        """Count empty string items (0x1B tokens) in STRL data."""
+        count = 0
+        pos = 0
+        esc = b'\x1b'
+        data_len = len(raw_data)
+
+        sp = raw_data.find(b' ', pos)
+        if sp == -1:
+            return 0
+        pos = sp + 1
+
+        while pos < data_len:
+            sp = raw_data.find(b' ', pos)
+            if sp == -1:
+                if raw_data[pos:] == esc:
+                    count += 1
+                break
+            if sp - pos == 1 and raw_data[pos:pos + 1] == esc:
+                count += 1
+            pos = sp + 1
+
+        return count
+
+    def _count_empty_lists(self, raw_data):
+        """Count list entries with size 0 in StorageUtil list chunks.
+        Format: objCount [objKey keyCount [keyName listSize [items...]]*]*"""
+        count = 0
+        pos = 0
+
+        def read_token():
+            nonlocal pos
+            sp = raw_data.find(b' ', pos)
+            if sp == -1:
+                t = raw_data[pos:]
+                pos = len(raw_data)
+                return t
+            t = raw_data[pos:sp]
+            pos = sp + 1
+            return t
+
+        try:
+            obj_count = int(read_token())
+            for _ in range(obj_count):
+                if pos >= len(raw_data):
+                    break
+                read_token()  # objKey
+                kc = int(read_token())
+                for _ in range(kc):
+                    if pos >= len(raw_data):
+                        break
+                    read_token()  # keyName
+                    ls = int(read_token())
+                    if ls == 0:
+                        count += 1
+                    elif ls > 0:
+                        pos = _skip_n_tokens(raw_data, pos, ls)
+        except (ValueError, IndexError):
+            pass
+
+        return count
+
+    def _analyze_form_keys(self, raw_data):
+        """Analyze StorageUtil object keys for temporary forms (0xFF) and
+        orphaned mod indices (not in PLGN).
+        Returns (temp_count, orphan_indices) where orphan_indices is
+        {mod_index: count} for indices not in the active load order."""
+        temp_count = 0
+        orphan_indices = {}  # mod_index -> count
+        pos = 0
+
+        def read_token():
+            nonlocal pos
+            sp = raw_data.find(b' ', pos)
+            if sp == -1:
+                t = raw_data[pos:]
+                pos = len(raw_data)
+                return t
+            t = raw_data[pos:sp]
+            pos = sp + 1
+            return t
+
+        try:
+            obj_count = int(read_token())
+            for _ in range(obj_count):
+                if pos >= len(raw_data):
+                    break
+                obj_key_token = read_token()
+                obj_key = 0 if obj_key_token == b'\x1b' else int(obj_key_token)
+
+                if obj_key != 0:
+                    mod_idx = (obj_key >> 24) & 0xFF
+                    if mod_idx == 0xFF:
+                        temp_count += 1
+                    elif self.regular_mods is not None and mod_idx not in self.regular_mods:
+                        orphan_indices[mod_idx] = orphan_indices.get(mod_idx, 0) + 1
+
+                kc_token = read_token()
+                if not kc_token:
+                    break
+                kc = int(kc_token)
+                for _ in range(kc):
+                    if pos >= len(raw_data):
+                        break
+                    read_token()  # keyName
+                    ls_token = read_token()
+                    if not ls_token:
+                        break
+                    ls = int(ls_token)
+                    if ls > 0:
+                        pos = _skip_n_tokens(raw_data, pos, ls)
+        except (ValueError, IndexError):
+            pass
+
+        return temp_count, orphan_indices
+
+    def _populate_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        self.checked.clear()
+
+        for idx, prob in enumerate(self.problems):
+            var = tk.BooleanVar(value=False)
+            self.checked[idx] = var
+
+            self.tree.insert("", tk.END, iid=f"prob{idx}",
+                values=(
+                    prob['severity'],
+                    prob['plugin_name'],
+                    prob['chunk_type'],
+                    format_size(prob['chunk_size']),
+                    prob['reason'],
+                    "\u2610",
+                ),
+                tags=(prob['tag'],))
+
+    def _on_click(self, event):
+        col = self.tree.identify_column(event.x)
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+
+        idx = int(item_id[4:])  # "prob0" -> 0
+
+        # Check column is #6 (Del?)
+        if col == "#6" and idx in self.checked:
+            var = self.checked[idx]
+            var.set(not var.get())
+            self._update_check_display(item_id, idx, var.get())
+            self._update_status()
+        else:
+            # Enable View button when a row is selected
+            self.btn_view.configure(state=tk.NORMAL)
+
+    def _on_double_click(self, event):
+        """Double-click to view the problem in the main browser."""
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        idx = int(item_id[4:])
+        self._navigate_to_problem(idx)
+
+    def _view_selected(self):
+        """View the currently selected problem in the main browser."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0][4:])
+        self._navigate_to_problem(idx)
+
+    def _navigate_to_problem(self, idx):
+        """Select the problem's chunk/plugin in the main tree and show details."""
+        prob = self.problems[idx]
+        pi = prob['pi']
+        ci = prob['ci']
+
+        # Build the tree item ID
+        if ci is not None:
+            target_id = f"c{pi}_{ci}"
+            parent_id = f"p{pi}"
+            # Make sure parent is expanded
+            self.app.tree.item(parent_id, open=True)
+        else:
+            target_id = f"p{pi}"
+
+        # Select and show in main tree
+        try:
+            self.app.tree.selection_set(target_id)
+            self.app.tree.see(target_id)
+            self.app.tree.focus(target_id)
+            self.app._show_details(target_id)
+        except tk.TclError:
+            pass  # item may be filtered by search
+
+    def _update_check_display(self, item_id, idx, is_checked):
+        symbol = "\u2611" if is_checked else "\u2610"
+        vals = list(self.tree.item(item_id, "values"))
+        vals[5] = symbol
+        self.tree.item(item_id, values=tuple(vals))
+
+        tag = "checked" if is_checked else self.problems[idx]['tag']
+        self.tree.item(item_id, tags=(tag,))
+
+    def _toggle_select_all(self):
+        target = self.select_all_var.get()
+        for idx, var in self.checked.items():
+            var.set(target)
+            self._update_check_display(f"prob{idx}", idx, target)
+        self._update_status()
+
+    def _update_status(self):
+        selected = sum(1 for v in self.checked.values() if v.get())
+        total_bytes = sum(
+            self.problems[idx]['chunk_size']
+            for idx, v in self.checked.items() if v.get())
+
+        if not self.problems:
+            self.lbl_status.configure(text="No problems detected!")
+            self.btn_apply.configure(state=tk.DISABLED)
+        elif selected > 0:
+            self.lbl_status.configure(
+                text=f"Found {len(self.problems)} issue(s)  |  "
+                     f"Selected: {selected} ({format_size(total_bytes)})")
+            self.btn_apply.configure(state=tk.NORMAL)
+        else:
+            self.lbl_status.configure(
+                text=f"Found {len(self.problems)} issue(s)  |  "
+                     f"Select items to mark for removal")
+            self.btn_apply.configure(state=tk.DISABLED)
+
+    def _sort_by(self, col):
+        """Sort the problem list by a column."""
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+            if col == "size":
+                self._sort_asc = False  # largest first by default
+
+        # Severity sort order (most severe first)
+        sev_order = {'CRITICAL': 0, 'WARNING': 1, 'NOTE': 2, 'INFO': 3}
+
+        items = list(self.tree.get_children(""))
+        if not items:
+            return
+
+        def sort_key(item_id):
+            idx = int(item_id[4:])
+            prob = self.problems[idx]
+            if col == "severity":
+                return sev_order.get(prob['severity'], 99)
+            elif col == "plugin":
+                return _natural_sort_key(prob['plugin_name'])
+            elif col == "chunk":
+                return prob['chunk_type'].lower()
+            elif col == "size":
+                return prob['chunk_size']
+            elif col == "detail":
+                return prob['reason'].lower()
+            return 0
+
+        items.sort(key=sort_key, reverse=not self._sort_asc)
+
+        for item_id in items:
+            self.tree.detach(item_id)
+        for item_id in items:
+            self.tree.reattach(item_id, "", tk.END)
+
+        # Update header arrows
+        arrow = " \u25b2" if self._sort_asc else " \u25bc"
+        for c in ("severity", "plugin", "chunk", "size", "detail"):
+            text = {"severity": "Severity", "plugin": "Plugin", "chunk": "Chunk",
+                    "size": "Size", "detail": "Details"}[c]
+            if c == col:
+                text += arrow
+            self.tree.heading(c, text=text)
+
+    def _apply(self):
+        """Apply fixes for selected problems. STRL issues get surgical cleanup;
+        non-STRL chunks get marked for whole-chunk removal."""
+        selected = [(idx, self.problems[idx])
+                     for idx, var in self.checked.items() if var.get()]
+        if not selected:
+            return
+
+        # Separate into surgical STRL fixes and whole-chunk deletions
+        strl_fixes = {}  # (pi, ci) -> set of fix_types
+        chunk_deletes = set()  # (pi, ci)
+
+        for idx, prob in selected:
+            if prob['ci'] is None:
+                continue
+            fix = prob.get('fix_type', 'delete_chunk')
+            if fix.startswith('strl_clean'):
+                key = (prob['pi'], prob['ci'])
+                if key not in strl_fixes:
+                    strl_fixes[key] = set()
+                strl_fixes[key].add(fix)
+            else:
+                chunk_deletes.add((prob['pi'], prob['ci']))
+
+        # Perform surgical STRL cleanup
+        strl_cleaned = 0
+        for (pi, ci), fix_types in strl_fixes.items():
+            chunk = self.app.plugins[pi]['chunks'][ci]
+            cc = fourcc_str(chunk['type'])
+            if cc != "STRL":
+                chunk_deletes.add((pi, ci))
+                continue
+
+            try:
+                entries = parse_strl_structure(chunk['raw_data'])
+            except Exception:
+                chunk_deletes.add((pi, ci))
+                continue
+
+            # Build removal set: entries with all-empty items or orphaned form keys
+            remove_entries = set()
+            for oi, entry in enumerate(entries):
+                obj_key = entry['obj_key']
+                should_remove = False
+
+                if 'strl_clean_orphans' in fix_types:
+                    # Remove entries with 0xFF temp form keys
+                    if obj_key != 0 and (obj_key >> 24) == 0xFF:
+                        should_remove = True
+                    # Remove entries with orphaned mod indices
+                    if (obj_key != 0 and self.regular_mods is not None
+                            and (obj_key >> 24) & 0xFF not in self.regular_mods
+                            and (obj_key >> 24) != 0xFE):  # skip ESL range
+                        should_remove = True
+
+                if 'strl_clean_empties' in fix_types or 'strl_clean_empty_lists' in fix_types:
+                    for ki, key in enumerate(entry['keys']):
+                        # Remove keys that are entirely empty strings
+                        if key['list_size'] > 0:
+                            # Check if all items are empty (0x1B)
+                            start, end = key['byte_range']
+                            # Skip keyName and listSize tokens to get to items
+                            key_data = chunk['raw_data'][start:end]
+                            # Count 0x1B tokens in this key's items
+                            # Simple heuristic: if key name is empty and list is empty strings
+                            pass  # handled at object level below
+                        if key['list_size'] == 0 and 'strl_clean_empty_lists' in fix_types:
+                            remove_entries.add((oi, ki))
+
+                if should_remove:
+                    for ki in range(len(entry['keys'])):
+                        remove_entries.add((oi, ki))
+
+            # For empty strings: remove keys where all items are 0x1B
+            if 'strl_clean_empties' in fix_types:
+                for oi, entry in enumerate(entries):
+                    for ki, key in enumerate(entry['keys']):
+                        if key['list_size'] > 0:
+                            start, end = key['byte_range']
+                            key_raw = chunk['raw_data'][start:end]
+                            # Count non-empty items by checking tokens after keyName+listSize
+                            # Find the items portion
+                            p = 0
+                            sp = key_raw.find(b' ', p)  # skip keyName
+                            if sp != -1:
+                                p = sp + 1
+                                sp = key_raw.find(b' ', p)  # skip listSize
+                                if sp != -1:
+                                    p = sp + 1
+                                    items_data = key_raw[p:]
+                                    # Count non-0x1B tokens
+                                    all_empty = True
+                                    ip = 0
+                                    while ip < len(items_data):
+                                        sp2 = items_data.find(b' ', ip)
+                                        if sp2 == -1:
+                                            token = items_data[ip:]
+                                            if token and token != b'\x1b':
+                                                all_empty = False
+                                            break
+                                        token = items_data[ip:sp2]
+                                        if token != b'\x1b':
+                                            all_empty = False
+                                            break
+                                        ip = sp2 + 1
+                                    if all_empty:
+                                        remove_entries.add((oi, ki))
+
+            if remove_entries:
+                try:
+                    new_data = rebuild_strl_data(chunk['raw_data'], entries, remove_entries)
+                    old_len = chunk['length']
+                    new_len = len(new_data)
+                    chunk['raw_data'] = new_data
+                    chunk['length'] = new_len
+                    chunk['raw_header'] = chunk['raw_header'][:8] + pack_uint32(new_len)
+                    strl_cleaned += old_len - new_len
+                except Exception:
+                    chunk_deletes.add((pi, ci))
+
+        # Store results
+        self.result_remove_set = chunk_deletes if chunk_deletes else None
+        self.result_strl_cleaned = strl_cleaned
+        self.dialog.destroy()
 
 
 # ─── STRL Editor Dialog ──────────────────────────────────────────────────────
