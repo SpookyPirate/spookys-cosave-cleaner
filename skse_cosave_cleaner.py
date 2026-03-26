@@ -2466,7 +2466,7 @@ def _get_icon_path():
     """Find the icon file, works both from source and PyInstaller bundle."""
     import sys
     if getattr(sys, '_MEIPASS', None):
-        return os.path.join(sys._MEIPASS, 'icon.ico')
+        return os.path.join(sys._MEIPASS, 'graphics', 'icon.ico')
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         'graphics', 'icon.ico')
 
