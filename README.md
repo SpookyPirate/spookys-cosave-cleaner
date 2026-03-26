@@ -10,6 +10,10 @@ A GUI tool for inspecting and surgically cleaning SKSE co-save (`.skse`) files u
   <img src="graphics/spookys-cosave-cleaner-ui-picture-1.png" alt="Spooky's CoSave Cleaner UI" width="900">
 </p>
 
+<p align="center">
+  <img src="graphics/spookys-cosave-cleaner-ui-picture-2- Problem scanner.png" alt="Problem Scanner" width="900">
+</p>
+
 ## What It Does
 
 SKSE (Skyrim Script Extender) stores plugin data in `.skse` co-save files alongside each game save (`.ess`). Over time, these files can accumulate orphaned or bloated data from removed or malfunctioning mods — sometimes growing to hundreds of megabytes or even gigabytes. This causes long load times, memory exhaustion, and crashes.
